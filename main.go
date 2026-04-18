@@ -35,7 +35,6 @@ func main() {
 	err := godotenv.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error loading .env file")
-		os.Exit(1)
 	}
 
 	port := os.Getenv("PORT")
