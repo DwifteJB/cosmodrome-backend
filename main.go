@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	imageroutes "rmfosho/cosmodrome-image-server/src/routes/image"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -44,6 +45,7 @@ func main() {
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
+	imageroutes.Register(r)
 
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		catURL, err := getRandomCat()

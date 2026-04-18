@@ -1,4 +1,4 @@
-package image
+package imageroutes
 
 import (
 	"crypto/rand"
@@ -80,7 +80,7 @@ func evictExpired() {
 	}
 }
 
-func RegisterImageRoutes(r chi.Router) {
+func Register(r chi.Router) {
 	baseURL = os.Getenv("BASE_URL")
 	if baseURL == "" {
 		fmt.Fprintln(os.Stderr, "BASE_URL is required (e.g. https://cosmodrome.rmfosho.me)")
