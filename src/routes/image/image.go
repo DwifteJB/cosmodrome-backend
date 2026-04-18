@@ -96,6 +96,12 @@ func Register(r chi.Router) {
 
 	ttl = time.Duration(ttlSecs) * time.Second
 
+	// send TTL
+	r.Get("/ttl", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int{"ttl_seconds": ttlSecs})
+	})
+
 	r.Post("/upload", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Image string `json:"image"`
