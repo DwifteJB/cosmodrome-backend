@@ -2,6 +2,7 @@ package imageroutes
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -26,11 +27,18 @@ type kv struct {
 	expires time.Time
 }
 
+type challenge struct {
+	expires time.Time
+}
+
 var (
-	mu      sync.RWMutex
-	store   = map[string]entry{}
-	baseURL string
-	ttl     time.Duration
+	mu            sync.RWMutex
+	store         = map[string]entry{}
+	challengeMu   sync.Mutex
+	challenges    = map[string]challenge{}
+	baseURL       string
+	ttl           time.Duration
+	powDifficulty int
 )
 
 func randomID() string {
@@ -49,25 +57,33 @@ func detectContentType(data []byte) string {
 	return "image/png"
 }
 
+func verifyPoW(ch string, nonce int) bool {
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s%d", ch, nonce)))
+	for i := 0; i < powDifficulty; i++ {
+		if hash[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // runs in bg and clears out old images every minute, and also ensures we don't have more than 100 entries in the store
 func evictExpired() {
 	for {
 		time.Sleep(time.Minute)
 		now := time.Now()
+
 		mu.Lock()
 		for id, e := range store {
 			if now.After(e.expires) {
 				delete(store, id)
 			}
 		}
-
-		// check if mu has more than 100 entries - if so, evict the oldest ones until we have 100
 		if len(store) > 100 {
 			var entries []kv
 			for id, e := range store {
 				entries = append(entries, kv{id: id, expires: e.expires})
 			}
-			// sort by expires
 			sort.Slice(entries, func(i, j int) bool {
 				return entries[i].expires.Before(entries[j].expires)
 			})
@@ -75,9 +91,29 @@ func evictExpired() {
 				delete(store, entries[i].id)
 			}
 		}
-		
 		mu.Unlock()
+
+		challengeMu.Lock()
+		for ch, c := range challenges {
+			if now.After(c.expires) {
+				delete(challenges, ch)
+			}
+		}
+		challengeMu.Unlock()
 	}
+}
+
+const maxUploadBytes = 5 << 20 // 5 MB
+
+func lookupEntry(file string) (entry, bool) {
+	id := strings.TrimSuffix(strings.TrimSuffix(file, ".png"), ".jpg")
+	mu.RLock()
+	e, ok := store[id]
+	mu.RUnlock()
+	if !ok || time.Now().After(e.expires) {
+		return entry{}, false
+	}
+	return e, true
 }
 
 func Register(r chi.Router) {
@@ -93,21 +129,67 @@ func Register(r chi.Router) {
 			ttlSecs = v
 		}
 	}
-
 	ttl = time.Duration(ttlSecs) * time.Second
 
-	// send TTL
+	powDifficulty = 3
+	if s := os.Getenv("POW_DIFFICULTY"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			powDifficulty = v
+		}
+	}
+
 	r.Get("/ttl", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]int{"ttl_seconds": ttlSecs})
 	})
 
+	// this is to prevent abuse of the upload endpoint since there's no authentication
+	// PROOF OF WORK!!!
+	r.Get("/challenge", func(w http.ResponseWriter, r *http.Request) {
+		b := make([]byte, 16)
+		rand.Read(b)
+		ch := fmt.Sprintf("%x", b)
+
+		challengeMu.Lock()
+		challenges[ch] = challenge{expires: time.Now().Add(5 * time.Minute)}
+		challengeMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"challenge":  ch,
+			"difficulty": powDifficulty,
+		})
+	})
+
 	r.Post("/upload", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+
 		var body struct {
-			Image string `json:"image"`
+			Image     string `json:"image"`
+			Challenge string `json:"challenge"`
+			Nonce     int    `json:"nonce"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Image == "" {
+
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Image == "" || body.Challenge == "" {
 			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+
+		// consume the challenge (single-use)
+		challengeMu.Lock()
+		ch, ok := challenges[body.Challenge]
+		if ok {
+			delete(challenges, body.Challenge)
+		}
+		challengeMu.Unlock()
+
+		if !ok || time.Now().After(ch.expires) {
+			http.Error(w, "invalid or expired challenge", http.StatusUnauthorized)
+			return
+		}
+
+		if !verifyPoW(body.Challenge, body.Nonce) {
+			http.Error(w, "proof of work failed", http.StatusUnauthorized)
 			return
 		}
 
@@ -133,20 +215,20 @@ func Register(r chi.Router) {
 		})
 	})
 
-	// {file} is the id and can end in .png or .jpg since we just ignore it
-	r.Get("/image/{file}", func(w http.ResponseWriter, r *http.Request) {
-		file := chi.URLParam(r, "file")
-		id := strings.TrimSuffix(strings.TrimSuffix(file, ".png"), ".jpg")
-
-		mu.RLock()
-		e, ok := store[id]
-		mu.RUnlock()
-
-		if !ok || time.Now().After(e.expires) {
+	r.Head("/image/{file}", func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := lookupEntry(chi.URLParam(r, "file")); !ok {
 			http.NotFound(w, r)
 			return
 		}
+		w.WriteHeader(http.StatusOK)
+	})
 
+	r.Get("/image/{file}", func(w http.ResponseWriter, r *http.Request) {
+		e, ok := lookupEntry(chi.URLParam(r, "file"))
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", detectContentType(e.data))
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		w.Write(e.data)
